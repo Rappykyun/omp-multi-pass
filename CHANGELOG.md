@@ -12,5 +12,9 @@
 - Use live native chat model catalogs with image-input metadata.
 - Remove other providers, cross-provider chains, presets, Pi compatibility code, and copied/source-text test harnesses.
 - Add native behavior checks and actual omp CLI smoke checks with a local fault-injection server.
+- Pin native credential IDs for each request and fail closed if the pinned account is removed or replaced.
+- Keep deleted subscription IDs from being reused; prune the current project's removed-account references.
+- Mark post-output quota failures on cooldown for the next request without replaying the current request.
+- Verify that a checkout without node_modules loads through the installed native omp binary.
 
 Real OAuth authorization and real Codex text/image requests were not tested. The user chose to skip these checks.

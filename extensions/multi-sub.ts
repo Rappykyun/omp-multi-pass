@@ -24,7 +24,7 @@ import {
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
-import * as z from "@oh-my-pi/omptype/zod";
+import { zod as z } from "@oh-my-pi/pi-coding-agent";
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -63,6 +63,7 @@ export interface PoolConfig {
 export interface MultiPassConfig {
   subscriptions: SubEntry[];
   pools: PoolConfig[];
+  nextSubscriptionIndex?: number;
 }
 export interface ProjectConfig {
   pools?: PoolConfig[];
@@ -141,6 +142,7 @@ const globalSchema = z
       )
       .default(() => []),
     pools: z.array(poolSchema).default(() => []),
+    nextSubscriptionIndex: z.number().int().min(2).optional(),
   })
   .strict()
   .refine(
@@ -339,8 +341,11 @@ export async function handleSubsAdd(
   const label = await ctx.ui.input("Codex subscription label (optional)");
   if (label === undefined) return;
   const config = loadGlobalConfig();
-  const index =
-    Math.max(1, ...config.subscriptions.map((entry) => entry.index)) + 1;
+  const index = Math.max(
+    config.nextSubscriptionIndex ?? 2,
+    Math.max(1, ...config.subscriptions.map((entry) => entry.index)) + 1,
+  );
+  config.nextSubscriptionIndex = index + 1;
   const entry = {
     provider: BASE,
     index,
@@ -364,11 +369,28 @@ export async function handleSubsRemove(
   if (
     !(await ctx.ui.confirm(
       `Remove ${name}?`,
-      "This removes the subscription, its login, and its global pool membership.",
+      "This removes the subscription, its login, and its current project and global pool references.",
     ))
   )
     return;
   const config = loadGlobalConfig();
+  config.nextSubscriptionIndex = Math.max(
+    config.nextSubscriptionIndex ?? 2,
+    Math.max(1, ...config.subscriptions.map((entry) => entry.index)) + 1,
+  );
+  const project = loadProjectConfig(ctx.cwd);
+  if (project) {
+    if (project.allowedSubs)
+      project.allowedSubs = project.allowedSubs.filter(
+        (provider) => provider !== name,
+      );
+    if (project.pools)
+      project.pools = project.pools.map((pool) => ({
+        ...pool,
+        members: pool.members.filter((member) => member !== name),
+      }));
+    saveJsonConfig(projectConfigPath(ctx.cwd), project);
+  }
   config.subscriptions = config.subscriptions.filter(
     (candidate) => subProviderName(candidate) !== name,
   );
@@ -455,11 +477,16 @@ export async function fetchQuota(
   auth: AuthStorage,
   provider: string,
   signal?: AbortSignal,
+  credentialId?: number,
 ): Promise<QuotaSnapshot> {
   signal?.throwIfAborted();
-  const access = await auth.oauth.access(provider, undefined, { signal });
+  const access =
+    credentialId === undefined
+      ? await auth.oauth.access(provider, undefined, { signal })
+      : await auth.oauth.accessById(provider, credentialId, { signal });
   signal?.throwIfAborted();
-  if (!access) return { error: "No usable OAuth credential" };
+  if (!access || ("ok" in access && !access.ok))
+    return { error: "No usable OAuth credential" };
   const report = await openaiCodexUsageProvider.fetchUsage(
     { provider: BASE, credential: { type: "oauth", ...access }, signal },
     { fetch },
@@ -1001,6 +1028,18 @@ export default function multiSub(pi: ExtensionAPI): void {
       getBundledModels(BASE).find((model) => model.id === requested.id);
     if (!nativeModel)
       throw new Error("No native Codex model definition for " + requested.id);
+    const pinned = new Map(
+      names.map((provider) => {
+        const accounts = registry.authStorage.oauth.accounts(
+          provider,
+          options?.sessionId,
+        );
+        return [
+          provider,
+          accounts.find((account) => account.active) ?? accounts[0],
+        ] as const;
+      }),
+    );
     const quotaCache = new Map<string, QuotaSnapshot>();
     let previousProvider = requested.provider;
     const lastUser =
@@ -1017,7 +1056,14 @@ export default function multiSub(pi: ExtensionAPI): void {
               .join("\n")
         : undefined;
     const quota = async (provider: string, signal?: AbortSignal) => {
-      const result = await fetchQuota(registry.authStorage, provider, signal);
+      const account = pinned.get(provider);
+      if (!account) return { error: "No snapshotted OAuth account" };
+      const result = await fetchQuota(
+        registry.authStorage,
+        provider,
+        signal,
+        account.credentialId,
+      );
       quotaCache.set(provider, result);
       return result;
     };
@@ -1060,9 +1106,14 @@ export default function multiSub(pi: ExtensionAPI): void {
         );
       },
       resolveOptions: async (selected, incoming) => {
-        const access = await registry.authStorage.oauth.access(
+        const account = pinned.get(selected.provider);
+        if (!account)
+          throw new Error(
+            selected.provider + " has no snapshotted OAuth login",
+          );
+        const access = await registry.authStorage.oauth.accessById(
           selected.provider,
-          options?.sessionId,
+          account.credentialId,
           {
             signal: incoming?.signal,
             modelId: selected.id,
@@ -1070,9 +1121,15 @@ export default function multiSub(pi: ExtensionAPI): void {
           },
         );
         incoming?.signal?.throwIfAborted();
-        if (!access)
+        if (
+          !access?.ok ||
+          access.accountId !== account.accountId ||
+          access.orgId !== account.orgId ||
+          access.email !== account.email
+        )
           throw new Error(
-            selected.provider + " has no usable OAuth login. Run /subs login.",
+            selected.provider +
+              " pinned account was removed or changed. Start a new request.",
           );
         const headers = new Headers({
           ...selected.headers,
@@ -1085,6 +1142,7 @@ export default function multiSub(pi: ExtensionAPI): void {
         return {
           ...incoming,
           apiKey: access.accessToken,
+          credentialId: access.credentialId,
           headers: Object.fromEntries(headers),
           oauthIdentity: {
             orgId: access.orgId,

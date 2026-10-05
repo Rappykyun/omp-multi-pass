@@ -87,10 +87,11 @@ The extension retries the provider request, not the user's whole prompt.
 - Each provider member is attempted at most once in that request.
 - Text, reasoning, or tool-call output closes the account-retry window.
 - A failure after output starts is returned without an account retry.
+- Quota failures after output still mark the account on cooldown for the next request.
 - Cancellation stops selection, refresh, and streaming.
 - Exhausted pools return a terminal error. They do not bypass project restrictions or use an unlisted core account.
 - The default cooldown is five minutes. A reported reset time takes precedence when available.
-- Account and pool settings are read at request start. Changes apply to the next request.
+- Pool settings and native credential identities are captured at request start. Added or replacement accounts apply to the next request. If a pinned identity is removed, the active request fails closed instead of using the replacement.
 
 A disabled pool does not prevent a permitted account from making a direct request.
 
@@ -106,6 +107,8 @@ Project configuration is `<cwd>/.omp/multi-pass.json`.
 Credentials stay in omp's supported credential store. The extension does not keep another token JSON file, copy MultiCodex tokens, or import `.pi` credentials.
 
 Configuration is validated before an atomic file replacement. Invalid existing files produce an error and are not replaced with empty configuration. Repair invalid files before you use a management command.
+
+Subscription IDs are not reused after removal. A saved next-ID counter prevents a new account from inheriting old project references. Removal prunes the current project's allow-list and pool members as well as global pool members; references in other projects remain inactive because the removed ID is never reused.
 
 ### Exact project account restrictions
 

@@ -77,18 +77,18 @@ export function createPoolStream(deps: PoolStreamDependencies): NativeStream {
             for await (const event of inner) {
               if ("partial" in event) partial = event.partial;
               if (event.type === "error") {
-                if (
-                  !visible &&
+                const quota =
                   !signal.aborted &&
                   isUsageLimitOutcome(
                     event.error.errorStatus,
                     event.error.errorMessage,
-                  )
-                ) {
+                  );
+                if (quota)
                   deps.markExhausted(
                     selected.provider,
                     event.error.errorMessage ?? "Quota exhausted",
                   );
+                if (quota && !visible) {
                   controller.abort();
                   retry = true;
                   partial = undefined;

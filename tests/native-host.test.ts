@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -12,6 +12,16 @@ import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import { events, token } from "./codex-fixture";
 import { getCustomApi } from "@oh-my-pi/pi-ai/api-registry";
 import { fetchQuota } from "../extensions/multi-sub";
+import {
+  handleSubsAdd,
+  handleSubsRemove,
+  loadGlobalConfig,
+  loadProjectConfig,
+} from "../extensions/multi-sub";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+} from "@oh-my-pi/pi-coding-agent";
 const originalAgentDir = getAgentDir();
 const roots: string[] = [];
 const stores: AuthStorage[] = [];
@@ -491,4 +501,238 @@ test("custom failover context names the most recently exhausted account", async 
   } finally {
     server.stop(true);
   }
+});
+test("a checkout without node_modules loads through the installed omp native host", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-mp-standalone-"));
+  roots.push(root);
+  const extension = join(root, "extensions");
+  cpSync(resolve("extensions"), extension, { recursive: true });
+  const agent = join(root, "agent");
+  mkdirSync(agent);
+  writeFileSync(
+    join(agent, "config.yml"),
+    "setupVersion: 2\nmemory:\n  backend: off\ncheckpoint:\n  enabled: false\nautolearn:\n  enabled: false\n",
+  );
+  writeFileSync(
+    join(agent, "models.yml"),
+    JSON.stringify({
+      providers: {
+        "local-check": {
+          baseUrl: "http://127.0.0.1:1/v1",
+          api: "openai-completions",
+          auth: "none",
+          models: [
+            {
+              id: "local",
+              name: "Local check",
+              reasoning: false,
+              input: ["text"],
+              contextWindow: 8192,
+              maxTokens: 256,
+            },
+          ],
+        },
+      },
+    }),
+  );
+  const executable = process.env.OMP_TEST_EXECUTABLE ?? Bun.which("omp");
+  if (!executable)
+    throw new Error(
+      "Install omp 18.6.1 or set OMP_TEST_EXECUTABLE for the native host check",
+    );
+  const child = Bun.spawn(
+    [
+      executable,
+      "--mode",
+      "rpc",
+      "--no-ui",
+      "--no-extensions",
+      "-e",
+      join(extension, "multi-sub.ts"),
+      "--model",
+      "local-check/local",
+      "--no-skills",
+      "--no-rules",
+      "--no-tools",
+      "--no-lsp",
+      "--no-title",
+    ],
+    {
+      cwd: root,
+      env: {
+        ...process.env,
+        PI_PROFILE: "",
+        OMP_PROFILE: "",
+        PI_CODING_AGENT_DIR: agent,
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  child.stdin.write('{"id":"startup","type":"get_state"}\n');
+  child.stdin.end();
+  const [stdout, stderr, exit] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  const frames = stdout
+    .trim()
+    .split("\n")
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line)];
+      } catch {
+        return [];
+      }
+    });
+  const commands =
+    frames.find((frame) => frame.type === "available_commands_update")
+      ?.commands ?? [];
+  expect(commands.map((command: { name: string }) => command.name)).toContain(
+    "subs",
+  );
+  expect(commands.map((command: { name: string }) => command.name)).toContain(
+    "pool",
+  );
+  expect(exit).toBe(0);
+}, 15000);
+
+test("fallback never adopts credentials introduced after request submission", async () => {
+  const { root, auth, registry, loaded } = await host();
+  for (const handler of loaded.extensions[0].handlers.get("session_start") ??
+    [])
+    await handler({}, { cwd: root, modelRegistry: registry });
+  const requests: string[] = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch: async (request) => {
+      const account = request.headers.get("chatgpt-account-id")!;
+      requests.push(account);
+      if (account === "first") {
+        await auth.credentials.set("openai-codex-3", {
+          type: "oauth",
+          access: token("replacement"),
+          refresh: "replacement",
+          expires: Date.now() + 3600000,
+          accountId: "replacement",
+        });
+        return Response.json(
+          {
+            error: {
+              code: "usage_limit_reached",
+              message: "Usage limit reached",
+            },
+          },
+          { status: 429 },
+        );
+      }
+      return new Response(events("success"), {
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    },
+  });
+  try {
+    const model = {
+      ...registry.getProviderModels("openai-codex-2")[0],
+      baseUrl: server.url.toString(),
+      preferWebsockets: false,
+    };
+    const result = await getCustomApi(model.api)!
+      .streamSimple(model, {
+        messages: [{ role: "user", content: "private request", timestamp: 1 }],
+      })
+      .result();
+    expect(result.stopReason).toBe("error");
+    expect(requests).toEqual(["first"]);
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("a post-output quota error cools the account for the next request without replay", async () => {
+  const { root, registry, loaded } = await host();
+  for (const handler of loaded.extensions[0].handlers.get("session_start") ??
+    [])
+    await handler({}, { cwd: root, modelRegistry: registry });
+  const requests: string[] = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch: (request) => {
+      const account = request.headers.get("chatgpt-account-id")!;
+      requests.push(account);
+      return new Response(
+        events(account === "first" ? "text-error" : "success"),
+        { headers: { "Content-Type": "text/event-stream" } },
+      );
+    },
+  });
+  try {
+    const model = {
+      ...registry.getProviderModels("openai-codex-2")[0],
+      baseUrl: server.url.toString(),
+      preferWebsockets: false,
+    };
+    const api = getCustomApi(model.api)!;
+    const first = await api
+      .streamSimple(model, {
+        messages: [{ role: "user", content: "first", timestamp: 1 }],
+      })
+      .result();
+    expect(first.stopReason).toBe("error");
+    expect(requests).toEqual(["first"]);
+    const next = await api
+      .streamSimple(model, {
+        messages: [{ role: "user", content: "next", timestamp: 2 }],
+      })
+      .result();
+    expect(next.stopReason).toBe("stop");
+    expect(requests).toEqual(["first", "second"]);
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("remove and re-add cannot inherit a deleted subscription's project permission", async () => {
+  const { root, registry, loaded } = await host();
+  mkdirSync(join(root, ".omp"));
+  const project = join(root, ".omp", "multi-pass.json");
+  writeFileSync(
+    project,
+    JSON.stringify({
+      allowedSubs: ["openai-codex-3"],
+      pools: [
+        {
+          name: "work",
+          baseProvider: "openai-codex",
+          members: ["openai-codex-3"],
+          enabled: true,
+        },
+      ],
+    }),
+  );
+  const ui = {
+    select: async () => "openai-codex-3",
+    confirm: async () => true,
+    notify() {},
+    input: async () => "replacement",
+  };
+  const ctx = {
+    cwd: root,
+    modelRegistry: registry,
+    ui,
+  } as unknown as ExtensionCommandContext;
+  const api = {
+    unregisterProvider: (name: string) => registry.unregisterProvider(name),
+  } as ExtensionAPI;
+  await handleSubsRemove(api, ctx);
+  expect(loadProjectConfig(root)?.allowedSubs).toEqual([]);
+  expect(
+    loadProjectConfig(root)?.pools?.flatMap((pool) => pool.members),
+  ).toEqual([]);
+  await handleSubsAdd(api, ctx, () => {});
+  expect(loadGlobalConfig().subscriptions.map((entry) => entry.index)).toEqual([
+    2, 4,
+  ]);
 });
